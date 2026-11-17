@@ -46,6 +46,7 @@
  *   --policy-fp16         | Use FP16 for policy TensorRT engine
  */
 #include <cmath>
+#include <csignal>
 #include <cuda_runtime_api.h>
 #include <memory>
 #include <mutex>
@@ -277,7 +278,11 @@ class G1Deploy {
     // External clients and peripheral managers
     // =========================================================================
     std::unique_ptr<unitree::robot::b2::MotionSwitcherClient> msc_;
-    
+    // Factory motion-control mode captured before ReleaseMode(), so Stop() can
+    // hand control back to it (e.g. "ai") instead of leaving the robot
+    // permanently released until a reboot.
+    std::string original_motion_mode_name_;
+
     // Dex3 hands manager
     Dex3Hands dex3_hands_;
 
@@ -2249,9 +2254,12 @@ class G1Deploy {
       msc_->SetTimeout(5.0f);
       msc_->Init();
       std::string form, name;
-      while (msc_->CheckMode(form, name), !name.empty()) {
+      msc_->CheckMode(form, name);
+      original_motion_mode_name_ = name;  // remember what to restore on Stop()
+      while (!name.empty()) {
         if (msc_->ReleaseMode()) std::cout << "Failed to switch to Release Mode\n";
         sleep(5);
+        msc_->CheckMode(form, name);
       }
 
       // create publisher
@@ -2700,6 +2708,16 @@ class G1Deploy {
       }
       CreateDampingCommand();
       LowCommandWriter();
+
+      // Hand control back to the factory motion-control service so the
+      // Unitree app / wireless remote work again without rebooting the robot.
+      if (msc_ && !original_motion_mode_name_.empty()) {
+        std::cout << "Restoring factory motion control mode: " << original_motion_mode_name_ << std::endl;
+        if (msc_->SelectMode(original_motion_mode_name_)) {
+          std::cerr << "[WARN] Failed to restore factory motion control mode\n";
+        }
+      }
+
       std::cout << "Stop" << std::endl;
     }
 
@@ -4082,6 +4100,15 @@ class G1Deploy {
     }
 };
 
+// Set by HandleShutdownSignal(); the main loop polls this so Ctrl+C (SIGINT)
+// and SIGTERM go through G1Deploy::Stop() instead of an abrupt kill, which
+// used to skip damping and never hand control back to the factory service.
+static volatile sig_atomic_t g_shutdown_requested = 0;
+
+void HandleShutdownSignal(int /*signum*/) {
+  g_shutdown_requested = 1;
+}
+
 /**
  * @brief Entry point: parse CLI arguments and run the G1 deployment application.
  *
@@ -4094,6 +4121,8 @@ class G1Deploy {
  * The main loop sleeps until the operator issues a stop signal or ROS2 shuts down.
  */
 int main(int argc, char const* argv[]) {
+  std::signal(SIGINT, HandleShutdownSignal);
+  std::signal(SIGTERM, HandleShutdownSignal);
   std::cout << "[DEBUG] Program starting..." << std::endl;
   if (argc < 4) {
     std::cout << "Usage: " << argv[0] << " <network_interface> <policy_file> <motion_data_path> [OPTIONS]"
@@ -4448,18 +4477,21 @@ int main(int argc, char const* argv[]) {
   // Main application loop - check both operator_state.stop and ROS2 status if using ROS2
 #if HAS_ROS2
   if (inputType == "ros2") {
-    while (!custom.operator_state.stop && rclcpp::ok()) { 
-      sleep(0.02); 
+    while (!custom.operator_state.stop && !g_shutdown_requested && rclcpp::ok()) {
+      sleep(0.02);
     }
     if (!rclcpp::ok()) {
       std::cout << "[INFO] ROS2 shutdown detected (Ctrl+C)" << std::endl;
     }
   } else {
-    while (!custom.operator_state.stop) { sleep(0.02); }
+    while (!custom.operator_state.stop && !g_shutdown_requested) { sleep(0.02); }
   }
 #else
-  while (!custom.operator_state.stop) { sleep(0.02); }
+  while (!custom.operator_state.stop && !g_shutdown_requested) { sleep(0.02); }
 #endif
+  if (g_shutdown_requested) {
+    std::cout << "[INFO] Shutdown signal received (Ctrl+C)" << std::endl;
+  }
   
   std::cout << "[DEBUG] Stopping G1Deploy..." << std::endl;
   custom.Stop();
